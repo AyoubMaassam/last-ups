@@ -1378,15 +1378,31 @@ def api_record_attendance(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            if not attendance.student_paid_for_session and student.prepaid_balance >= price_per_session:
+            # <<< FIX: Check enrollment date before processing payment >>>
+            try:
+                student_group_record = StudentGroup.objects.get(student=student, group=group)
+                enrollment_date = student_group_record.enrollment_date
+            except StudentGroup.DoesNotExist:
+                enrollment_date = None # Should not happen if data is consistent, but a safe fallback
+
+            # Conditions for payment
+            is_already_paid = attendance.student_paid_for_session
+            has_enough_balance = student.prepaid_balance >= price_per_session
+            is_after_enrollment = enrollment_date is not None and session.date >= enrollment_date
+
+            if not is_already_paid and has_enough_balance and is_after_enrollment:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
-                payment_status_message = "" # Set to empty to suppress notification, as per user request
-            elif attendance.student_paid_for_session:
+                payment_status_message = "" # Paid successfully
+            elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
-            else: # Not enough balance
+            elif enrollment_date and session.date < enrollment_date:
+                payment_status_message = "لم يتم الخصم (الحصة قبل تاريخ التسجيل)"
+            elif not has_enough_balance:
                 payment_status_message = f"رصيد غير كافٍ. الرصيد الحالي: {student.prepaid_balance.quantize(Decimal('0.01'))} دج"
+            # Default message remains "الحصة غير مدفوعة" if no other condition is met
+
         elif attendance.student_paid_for_session:
              payment_status_message = "الحصة مدفوعة بالفعل"
         else: # Price is zero
@@ -1452,9 +1468,20 @@ def student_payment(request, student_id):
                 if sessions_to_pay_count <= 0:
                     messages.error(request, "عدد الحصص للدفع يجب أن يكون أكبر من صفر.")
                 else:
-                    # Get all sessions for this student in this group, ordered by date
+                    # Get the student's enrollment date for this specific group
+                    try:
+                        student_group_enrollment = StudentGroup.objects.get(student=student, group=group_to_pay_for)
+                        enrollment_date = student_group_enrollment.enrollment_date
+                    except StudentGroup.DoesNotExist:
+                        messages.error(request, f"لم يتم العثور على تاريخ تسجيل الطالب في الفوج {group_to_pay_for.name}.")
+                        return redirect('student_payment', student_id=student_id)
+
+                    # Get all sessions for this student in this group, ordered by date, FILTERING by enrollment date
                     # We want to pay for the earliest unpaid sessions first.
-                    student_group_sessions = Session.objects.filter(group=group_to_pay_for).order_by('date', 'start_time')
+                    student_group_sessions = Session.objects.filter(
+                        group=group_to_pay_for,
+                        date__gte=enrollment_date  # <<< FIX: Only consider sessions on or after enrollment
+                    ).order_by('date', 'start_time')
 
                     paid_this_transaction_count = 0
                     sessions_marked_paid_info = []
@@ -2305,15 +2332,28 @@ def api_record_attendance_by_student(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
+            # <<< FIX: Check enrollment date before processing payment >>>
+            try:
+                student_group_record = StudentGroup.objects.get(student=student, group=group)
+                enrollment_date = student_group_record.enrollment_date
+            except StudentGroup.DoesNotExist:
+                enrollment_date = None
+
+            is_already_paid = attendance.student_paid_for_session
+            has_enough_balance = student.prepaid_balance >= price_per_session
+            is_after_enrollment = enrollment_date is not None and target_session.date >= enrollment_date
+
             # Check if student has enough balance and session is not already paid
-            if not attendance.student_paid_for_session and student.prepaid_balance >= price_per_session:
+            if not is_already_paid and has_enough_balance and is_after_enrollment:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
-                payment_status_message = "" # Set to empty to suppress notification, as per user request
-            elif attendance.student_paid_for_session:
+                payment_status_message = "" # Paid successfully
+            elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
-            else: # Not enough balance
+            elif enrollment_date and target_session.date < enrollment_date:
+                payment_status_message = "لم يتم الخصم (الحصة قبل تاريخ التسجيل)"
+            elif not has_enough_balance:
                 payment_status_message = f"رصيد غير كافٍ. الرصيد الحالي: {student.prepaid_balance.quantize(Decimal('0.01'))} دج"
         elif attendance.student_paid_for_session:
              payment_status_message = "الحصة مدفوعة بالفعل"
@@ -2324,12 +2364,19 @@ def api_record_attendance_by_student(request):
         attendance.save()
 
         auto_excused_message = ""
-        # Rule 2: If this is the student's first-ever 'present' record in this group, excuse previous absences.
-        if Attendance.objects.filter(student=student, session__group=target_session.group, present=True).count() == 1:
+        # Rule 2: If this is the student's first-ever 'present' record in this group, excuse previous absences *after enrollment*.
+        try:
+            student_group_record = StudentGroup.objects.get(student=student, group=target_session.group)
+            enrollment_date_for_excuse = student_group_record.enrollment_date
+        except StudentGroup.DoesNotExist:
+            enrollment_date_for_excuse = None
+
+        if enrollment_date_for_excuse and Attendance.objects.filter(student=student, session__group=target_session.group, present=True, session__date__gte=enrollment_date_for_excuse).count() == 1:
             previous_absences_to_excuse = Attendance.objects.filter(
                 student=student,
                 session__group=target_session.group,
                 session__date__lt=target_session.date,
+                session__date__gte=enrollment_date_for_excuse, # <<< FIX: Only excuse absences after enrollment
                 present=False,
                 excused_absence=False
             )
@@ -2412,6 +2459,10 @@ def student_monthly_payment_view(request, student_id):
 
             if enrollment_date:
                 all_student_sessions_for_group = all_student_sessions_for_group.filter(date__gte=enrollment_date)
+            else:
+                # If for some reason enrollment_date is not found, default to a safe value (e.g., filter nothing, or log error)
+                # For now, we proceed, but this indicates a potential data integrity issue if a student is in a group without an enrollment record.
+                pass
 
             # The following loop for sessions_display will now use the potentially filtered all_student_sessions_for_group
 
@@ -2616,6 +2667,18 @@ def student_monthly_payment_view(request, student_id):
                     sessions_to_pay_for = []
                     # Use the correctly fetched group details for POST
                     all_sessions_chronological = Session.objects.filter(group=current_group_details_post).order_by('date', 'start_time')
+
+                    # <<< FIX: Apply enrollment_date filter during payment processing >>>
+                    try:
+                        student_group_for_payment = StudentGroup.objects.get(student=student, group=current_group_details_post)
+                        enrollment_date_for_payment = student_group_for_payment.enrollment_date
+                        if enrollment_date_for_payment:
+                            all_sessions_chronological = all_sessions_chronological.filter(date__gte=enrollment_date_for_payment)
+                    except StudentGroup.DoesNotExist:
+                        # This case should ideally not be reached if validation is correct, but as a safeguard:
+                        messages.error(request, "لم يتم العثور على تاريخ تسجيل الطالب في الفوج. لا يمكن متابعة الدفع.")
+                        return redirect(reverse('student_monthly_payment', args=[student_id]) + f'?group_id={group_id_post}')
+
 
                     current_balance = amount_paid # Amount available to pay off sessions (includes prepaid if used)
                     sessions_paid_in_this_transaction_count = 0
