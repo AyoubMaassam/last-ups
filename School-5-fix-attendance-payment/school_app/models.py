@@ -95,6 +95,7 @@ class StudentGroup(models.Model):
     group = models.ForeignKey(Group, on_delete=models.CASCADE, verbose_name="الفوج")
     enrollment_date = models.DateField(auto_now_add=True, verbose_name="تاريخ التسجيل في الفوج")
     is_active = models.BooleanField(default=True, verbose_name="الحالة (نشط)")
+    is_free = models.BooleanField(default=False, verbose_name="تسجيل مجاني")
 
     class Meta:
         unique_together = ('student', 'group')
@@ -103,7 +104,8 @@ class StudentGroup(models.Model):
 
     def __str__(self):
         status = "نشط" if self.is_active else "موقوف"
-        return f"{self.student} in {self.group} since {self.enrollment_date} ({status})"
+        free_status = "مجاني" if self.is_free else "مدفوع"
+        return f"{self.student} in {self.group} since {self.enrollment_date} ({status}, {free_status})"
 
 class StudentSuspension(models.Model):
     student_group = models.ForeignKey(StudentGroup, on_delete=models.CASCADE, related_name='suspensions', verbose_name="تسجيل الطالب في الفوج")

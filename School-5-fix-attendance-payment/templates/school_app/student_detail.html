@@ -112,17 +112,29 @@
                                         <li>غائب وغير مدفوع: {{ group_stat.absent_not_paid_count }}</li>
                                     </ul>
                                 </div>
-                                <div>
+                                <div class="btn-group" role="group">
                                     {% if group_stat.student_group_id %}
-                                        <form action="{% url 'toggle_student_suspension' group_stat.student_group_id %}" method="post" class="ml-auto">
+                                        <form action="{% url 'toggle_student_suspension' group_stat.student_group_id %}" method="post" style="display: inline-block;">
                                             {% csrf_token %}
                                             {% if group_stat.is_active %}
-                                                <button type="submit" class="btn btn-warning" onclick="return confirm('هل أنت متأكد أنك تريد تجميد تسجيل هذا الطالب في الفوج؟ لن يتم احتساب الحصص القادمة له.');">
-                                                    <i class="fas fa-pause-circle"></i> تجميد التسجيل
+                                                <button type="submit" class="btn btn-sm btn-warning" onclick="return confirm('هل أنت متأكد أنك تريد تجميد تسجيل هذا الطالب في الفوج؟');">
+                                                    <i class="fas fa-pause-circle"></i> تجميد
                                                 </button>
                                             {% else %}
-                                                <button type="submit" class="btn btn-success" onclick="return confirm('هل أنت متأكد أنك تريد إعادة تنشيط تسجيل هذا الطالب في الفوج؟ سيتم احتساب الحصص القادمة له مرة أخرى.');">
-                                                    <i class="fas fa-play-circle"></i> إعادة تنشيط
+                                                <button type="submit" class="btn btn-sm btn-success" onclick="return confirm('هل أنت متأكد أنك تريد إعادة تنشيط تسجيل هذا الطالب؟');">
+                                                    <i class="fas fa-play-circle"></i> تنشيط
+                                                </button>
+                                            {% endif %}
+                                        </form>
+                                        <form action="{% url 'toggle_free_status' group_stat.student_group_id %}" method="post" style="display: inline-block; margin-left: 5px;">
+                                            {% csrf_token %}
+                                            {% if group_stat.is_free %}
+                                                <button type="submit" class="btn btn-sm btn-secondary" onclick="return confirm('هل أنت متأكد أنك تريد إلغاء مجانية التسجيل لهذا الطالب في الفوج؟ سيتم احتساب الرسوم له من الآن فصاعداً.');">
+                                                    <i class="fas fa-dollar-sign"></i> إجعله مدفوع
+                                                </button>
+                                            {% else %}
+                                                <button type="submit" class="btn btn-sm btn-info" onclick="return confirm('هل أنت متأكد أنك تريد تفعيل المجانية لهذا الطالب في الفوج؟ لن يتم احتساب أي رسوم له.');">
+                                                    <i class="fas fa-gift"></i> إجعله مجاني
                                                 </button>
                                             {% endif %}
                                         </form>

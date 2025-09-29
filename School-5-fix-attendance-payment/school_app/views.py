@@ -237,10 +237,12 @@ def student_detail(request, student_id):
             student_group = StudentGroup.objects.get(student=student, group=group)
             enrollment_date = student_group.enrollment_date
             is_active = student_group.is_active
+            is_free = student_group.is_free
             student_group_id = student_group.id
         except StudentGroup.DoesNotExist:
             enrollment_date = None # Should not happen if student is in group.students.all()
             is_active = True # Default assumption
+            is_free = False # Default assumption
             student_group_id = None # No StudentGroup record exists
 
         # Start with sessions up to today
@@ -333,6 +335,7 @@ def student_detail(request, student_id):
             'group_id': group.id,
             'student_group_id': student_group_id,
             'is_active': is_active,
+            'is_free': is_free,
             'group_name': group.name,
             'subject_name': group.subject.name,
             'teacher_name': group.teacher.full_name,
@@ -578,6 +581,23 @@ def toggle_student_suspension(request, student_group_id):
                 latest_suspension.save()
 
             messages.success(request, f"تم إعادة تنشيط تسجيل الطالب '{student.full_name}' في الفوج '{student_group.group.name}' بنجاح.")
+
+    return redirect('student_detail', student_id=student.id)
+
+
+@require_POST
+def toggle_free_status(request, student_group_id):
+    student_group = get_object_or_404(StudentGroup.objects.select_related('student', 'group'), id=student_group_id)
+    student = student_group.student
+
+    # Toggle the is_free status
+    student_group.is_free = not student_group.is_free
+    student_group.save()
+
+    if student_group.is_free:
+        messages.success(request, f"تم تحديد تسجيل الطالب '{student.full_name}' في الفوج '{student_group.group.name}' كـ 'مجاني' بنجاح.")
+    else:
+        messages.success(request, f"تم إلغاء التسجيل المجاني للطالب '{student.full_name}' في الفوج '{student_group.group.name}'. سيتم الآن احتساب الرسوم.")
 
     return redirect('student_detail', student_id=student.id)
 
@@ -1419,14 +1439,16 @@ def api_record_attendance(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date and suspension status before processing payment >>>
+            # <<< FIX: Check enrollment date, suspension, and free status before processing payment >>>
             try:
                 student_group_record = StudentGroup.objects.get(student=student, group=group)
                 enrollment_date = student_group_record.enrollment_date
                 suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
+                is_free_enrollment = student_group_record.is_free
             except StudentGroup.DoesNotExist:
                 enrollment_date = None # Should not happen if data is consistent, but a safe fallback
                 suspension_periods = []
+                is_free_enrollment = False
 
             # Conditions for payment
             is_already_paid = attendance.student_paid_for_session
@@ -1440,7 +1462,9 @@ def api_record_attendance(request):
                     is_suspended = True
                     break
 
-            if not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
+            if is_free_enrollment:
+                payment_status_message = "تسجيل مجاني"
+            elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
@@ -1516,6 +1540,12 @@ def student_payment(request, student_id):
             try:
                 sessions_to_pay_count = int(sessions_to_pay_count_str)
                 group_to_pay_for = get_object_or_404(Group, id=group_id)
+
+                # <<< FIX: Check if enrollment is free >>>
+                student_group_enrollment_check = get_object_or_404(StudentGroup, student=student, group=group_to_pay_for)
+                if student_group_enrollment_check.is_free:
+                    messages.info(request, f"لا يمكن دفع الحصص. الطالب '{student.full_name}' مسجل مجاناً في هذا الفوج.")
+                    return redirect('student_payment', student_id=student_id)
 
                 if sessions_to_pay_count <= 0:
                     messages.error(request, "عدد الحصص للدفع يجب أن يكون أكبر من صفر.")
@@ -2398,14 +2428,16 @@ def api_record_attendance_by_student(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date and suspension status before processing payment >>>
+            # <<< FIX: Check enrollment date, suspension, and free status before processing payment >>>
             try:
                 student_group_record = StudentGroup.objects.get(student=student, group=group)
                 enrollment_date = student_group_record.enrollment_date
                 suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
+                is_free_enrollment = student_group_record.is_free
             except StudentGroup.DoesNotExist:
                 enrollment_date = None
                 suspension_periods = []
+                is_free_enrollment = False
 
             is_already_paid = attendance.student_paid_for_session
             has_enough_balance = student.prepaid_balance >= price_per_session
@@ -2419,7 +2451,9 @@ def api_record_attendance_by_student(request):
                     break
 
             # Check if student has enough balance and session is not already paid
-            if not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
+            if is_free_enrollment:
+                payment_status_message = "تسجيل مجاني"
+            elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
@@ -2600,10 +2634,16 @@ def student_monthly_payment_view(request, student_id):
             # Recalculate unpaid_sessions_count for amount_due accurately
             # This should count sessions that require payment.
             billable_unpaid_count = 0
-            # Also calculate attended_but_not_paid_sessions_count in the same loop
 
-            # <<< FIX: Fetch suspension periods to exclude them from calculations >>>
-            suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group))
+            # <<< FIX: If the enrollment is marked as free, no amount is due >>>
+            if student_group.is_free:
+                gross_amount_due = Decimal('0.00')
+                attended_but_not_paid_sessions_count = 0 # Reset this as well
+            else:
+                # Also calculate attended_but_not_paid_sessions_count in the same loop
+
+                # <<< FIX: Fetch suspension periods to exclude them from calculations >>>
+                suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group))
 
             # Base query for chronological sessions
             all_sessions_for_group_chronological = Session.objects.filter(
@@ -2728,6 +2768,18 @@ def student_monthly_payment_view(request, student_id):
             amount_paid_str = request.POST.get('amount_paid')
             try:
                 amount_paid_from_form = Decimal(amount_paid_str) # Renamed to avoid conflict
+
+                # <<< FIX: Check if enrollment is free before processing payment >>>
+                student_group_for_payment_check = current_group_details_post.studentgroup_set.get(student=student)
+                if student_group_for_payment_check.is_free:
+                    if amount_paid_from_form > Decimal('0.00'):
+                        student.prepaid_balance += amount_paid_from_form
+                        student.save()
+                        messages.success(request, f"الطالب يدرس مجاناً في هذا الفوج. تم إضافة المبلغ المدفوع ({amount_paid_from_form} دج) إلى رصيده العام.")
+                    else:
+                        messages.info(request, "لا يمكن معالجة دفعة بقيمة صفر.")
+                    return redirect(reverse('student_monthly_payment', args=[student_id]) + f'?group_id={group_id_post}')
+
                 amount_paid = amount_paid_from_form # Effective amount to be used for payment processing
 
                 prepaid_used_this_transaction = Decimal('0.00')
@@ -2993,6 +3045,10 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
     student_count_str = request.GET.get('student_count', '0')
     total_sessions_str = request.GET.get('total_sessions', '0')
     excused_absences_count_str = request.GET.get('excused_absences_count', '0')
+    # <<< FIX: Retrieve free student stats from GET params >>>
+    total_free_presences_str = request.GET.get('total_free_presences', '0')
+    total_free_absences_str = request.GET.get('total_free_absences', '0')
+
 
     try:
         total_payment_amount = Decimal(total_payment_amount_str)
@@ -3002,6 +3058,8 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         student_count = int(student_count_str)
         total_sessions = int(total_sessions_str)
         excused_absences_count = int(excused_absences_count_str)
+        total_free_presences = int(total_free_presences_str)
+        total_free_absences = int(total_free_absences_str)
     except (ValueError, TypeError):
         messages.error(request, "بيانات الإيصال غير صالحة.")
         return redirect(reverse('teacher_monthly_payment', args=[teacher_id]) + f"?group_id={group_id}")
@@ -3016,6 +3074,8 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         'student_count': student_count,
         'total_sessions': total_sessions,
         'excused_absences_count': excused_absences_count,
+        'total_free_presences': total_free_presences,
+        'total_free_absences': total_free_absences,
         'print_date': timezone.now(),
     }
     return render(request, 'school_app/print_teacher_payment_receipt.html', context)
@@ -3061,13 +3121,16 @@ def teacher_monthly_payment_view(request, teacher_id):
                     'receipt_url': request.session.pop('last_teacher_payment_receipt_url', None)
                 })
 
-            # --- FIX: Expanded Calculation Logic to handle suspensions ---
+            # --- FIX: Expanded Calculation Logic to handle suspensions and free students ---
 
-            # 1. Pre-fetch all suspension data for students in the current group
+            # 1. Pre-fetch all StudentGroup data for students in the current group
             student_groups_in_group = StudentGroup.objects.filter(group=current_group_post)
-            suspension_map = {}
+            student_data_map = {}
             for sg in student_groups_in_group:
-                suspension_map[sg.student_id] = list(StudentSuspension.objects.filter(student_group=sg))
+                student_data_map[sg.student_id] = {
+                    'is_free': sg.is_free,
+                    'suspensions': list(StudentSuspension.objects.filter(student_group=sg))
+                }
 
             # 2. Get all relevant attendance records
             attendance_records = Attendance.objects.filter(
@@ -3075,18 +3138,23 @@ def teacher_monthly_payment_view(request, teacher_id):
                 session__group=current_group_post
             ).select_related('session')
 
-            # 3. Iterate and count payable instances, checking for suspensions
+            # 3. Iterate and count instances, separating payable from free
             total_payable_instances = 0
             total_presences = 0
             total_unexcused_absences = 0
+            total_free_presences = 0
+            total_free_absences = 0 # unexcused absences for free students
 
             for att in attendance_records:
-                # Rule 1: Instance is not payable if absence is excused
+                student_data = student_data_map.get(att.student_id, {})
+                is_free = student_data.get('is_free', False)
+
+                # Rule: Excused absences are never counted for anyone
                 if not att.present and att.excused_absence:
                     continue
 
-                # Rule 2: Instance is not payable if student was suspended
-                student_suspensions = suspension_map.get(att.student_id, [])
+                # Rule: Suspended attendances are never counted for anyone
+                student_suspensions = student_data.get('suspensions', [])
                 is_suspended = False
                 for susp in student_suspensions:
                     is_open_suspension = susp.end_date is None
@@ -3096,12 +3164,18 @@ def teacher_monthly_payment_view(request, teacher_id):
                 if is_suspended:
                     continue
 
-                # If checks pass, it's a payable instance
-                total_payable_instances += 1
-                if att.present:
-                    total_presences += 1
-                else: # Not present and not excused
-                    total_unexcused_absences += 1
+                # Now, separate logic for free vs payable
+                if is_free:
+                    if att.present:
+                        total_free_presences += 1
+                    else: # Unexcused absence
+                        total_free_absences += 1
+                else: # Payable student
+                    total_payable_instances += 1
+                    if att.present:
+                        total_presences += 1
+                    else: # Unexcused absence
+                        total_unexcused_absences += 1
 
             try:
                 teacher_price_decimal = Decimal(teacher_price_per_session_str)
@@ -3119,7 +3193,10 @@ def teacher_monthly_payment_view(request, teacher_id):
                 'total_presences': total_presences,
                 'total_unexcused_absences_for_payment': total_unexcused_absences,
                 'total_payable_instances': total_payable_instances,
-                'calculated_total_payment': str(calculated_total_payment)
+                'calculated_total_payment': str(calculated_total_payment),
+                # <<< FIX: Add free student stats to session data >>>
+                'total_free_presences': total_free_presences,
+                'total_free_absences': total_free_absences,
             }
             messages.success(request, "تم حساب المبلغ. يرجى المراجعة والتأكيد.")
             return redirect(redirect_url)
@@ -3137,25 +3214,29 @@ def teacher_monthly_payment_view(request, teacher_id):
             final_payment_amount = Decimal('0.00')
             compensated_count = 0
 
-            # <<< FIX: Fetch suspension data ONCE before the loop >>>
+            # <<< FIX: Fetch suspension and free status data ONCE before the loop >>>
             student_groups_in_group_post = StudentGroup.objects.filter(group=current_group_post)
-            suspension_map_post = {}
+            student_data_map_post = {}
             for sg in student_groups_in_group_post:
-                suspension_map_post[sg.student_id] = list(StudentSuspension.objects.filter(student_group=sg))
-
+                student_data_map_post[sg.student_id] = {
+                    'is_free': sg.is_free,
+                    'suspensions': list(StudentSuspension.objects.filter(student_group=sg))
+                }
 
             with transaction.atomic():
                 sessions_to_process = Session.objects.filter(id__in=session_ids_to_mark, group=current_group_post).prefetch_related('attendance_set')
                 for session in sessions_to_process:
-                    # <<< FIX: Recalculate payable instances for this specific session, excluding suspended students >>>
+                    # <<< FIX: Recalculate payable instances for this specific session, excluding suspended and free students >>>
                     payable_instances_count = 0
                     for att in session.attendance_set.all():
+                        student_data = student_data_map_post.get(att.student_id, {})
+
                         # Rule 1: Not payable if excused absence
                         if not att.present and att.excused_absence:
                             continue
 
                         # Rule 2: Not payable if suspended
-                        student_suspensions = suspension_map_post.get(att.student_id, [])
+                        student_suspensions = student_data.get('suspensions', [])
                         is_suspended = False
                         for susp in student_suspensions:
                             is_open_suspension = susp.end_date is None
@@ -3163,6 +3244,10 @@ def teacher_monthly_payment_view(request, teacher_id):
                                 is_suspended = True
                                 break
                         if is_suspended:
+                            continue
+
+                        # Rule 3: Not payable if student is free
+                        if student_data.get('is_free', False):
                             continue
 
                         # If checks pass, it's a payable instance
@@ -3189,7 +3274,9 @@ def teacher_monthly_payment_view(request, teacher_id):
                               f"&total_absences_counted={calculated_payment_details.get('total_unexcused_absences_for_payment', 0)}" + \
                               f"&student_count={student_count}" + \
                               f"&total_sessions={len(session_ids_to_mark)}" + \
-                              f"&excused_absences_count={excused_absences_count}"
+                              f"&excused_absences_count={excused_absences_count}" + \
+                              f"&total_free_presences={calculated_payment_details.get('total_free_presences', 0)}" + \
+                              f"&total_free_absences={calculated_payment_details.get('total_free_absences', 0)}"
                 request.session['last_teacher_payment_receipt_url'] = receipt_url
                 messages.success(request, f"تم تسجيل دفع المستحقات لـ {compensated_count} حصة بنجاح.")
             else:

@@ -14,6 +14,7 @@ urlpatterns = [
     path('students/<int:student_id>/delete/', views.delete_student, name='delete_student'),
     path('students/<int:student_id>/enroll/', views.enroll_student_in_groups, name='enroll_student_in_groups'),
     path('students/groups/<int:student_group_id>/toggle_suspension/', views.toggle_student_suspension, name='toggle_student_suspension'),
+    path('students/groups/<int:student_group_id>/toggle_free/', views.toggle_free_status, name='toggle_free_status'),
     path('students/<int:student_id>/attendance/<int:attendance_id>/excuse/', views.mark_absence_excused, name='mark_absence_excused'),
     path('students/<int:student_id>/print_registration_confirmation/', views.print_registration_fee_confirmation, name='print_registration_confirmation'),
     path('students/<int:student_id>/monthly_payment/', views.student_monthly_payment_view, name='student_monthly_payment'),
