@@ -2,7 +2,7 @@ from django.shortcuts import render, get_object_or_404, redirect
 from django.http import JsonResponse, HttpResponseRedirect, Http404
 from django.db import transaction # For atomic operations if needed, though simple creation might not strictly need it yet
 from decimal import Decimal # Ensure Decimal is imported
-from .models import Student, Teacher, AcademicLevel, Subject, Group, Session, Attendance, ActionLog, StudentGroup
+from .models import Student, Teacher, AcademicLevel, Subject, Group, Session, Attendance, ActionLog, StudentGroup, StudentSuspension
 from django.urls import reverse # For redirecting with arguments
 import datetime # For year validation
 import math # For floor function
@@ -15,6 +15,7 @@ from django.urls import reverse_lazy
 from .forms import GroupForm, SessionForm # Import GroupForm and SessionForm
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 import logging
 
 # Helper function for logging
@@ -235,8 +236,12 @@ def student_detail(request, student_id):
         try:
             student_group = StudentGroup.objects.get(student=student, group=group)
             enrollment_date = student_group.enrollment_date
+            is_active = student_group.is_active
+            student_group_id = student_group.id
         except StudentGroup.DoesNotExist:
             enrollment_date = None # Should not happen if student is in group.students.all()
+            is_active = True # Default assumption
+            student_group_id = None # No StudentGroup record exists
 
         # Start with sessions up to today
         sessions_for_group_qs = group.sessions.filter(date__lte=today)
@@ -326,6 +331,8 @@ def student_detail(request, student_id):
 
         enrolled_groups_with_payment_stats.append({
             'group_id': group.id,
+            'student_group_id': student_group_id,
+            'is_active': is_active,
             'group_name': group.name,
             'subject_name': group.subject.name,
             'teacher_name': group.teacher.full_name,
@@ -540,6 +547,40 @@ def edit_student(request, student_id):
             'page_title': f"تعديل بيانات الطالب: {student.full_name}"
         }
         return render(request, 'school_app/edit_student.html', context)
+
+
+@require_POST
+def toggle_student_suspension(request, student_group_id):
+    student_group = get_object_or_404(StudentGroup.objects.select_related('student'), id=student_group_id)
+    student = student_group.student
+
+    with transaction.atomic():
+        # Toggle the active status
+        student_group.is_active = not student_group.is_active
+        student_group.save()
+
+        if not student_group.is_active:
+            # The student is now suspended, create a new suspension record
+            StudentSuspension.objects.create(
+                student_group=student_group,
+                start_date=timezone.now().date()
+            )
+            messages.success(request, f"تم تجميد تسجيل الطالب '{student.full_name}' في الفوج '{student_group.group.name}' بنجاح.")
+        else:
+            # The student is now re-activated, find the open suspension record and close it
+            latest_suspension = StudentSuspension.objects.filter(
+                student_group=student_group,
+                end_date__isnull=True
+            ).order_by('-start_date').first()
+
+            if latest_suspension:
+                latest_suspension.end_date = timezone.now().date()
+                latest_suspension.save()
+
+            messages.success(request, f"تم إعادة تنشيط تسجيل الطالب '{student.full_name}' في الفوج '{student_group.group.name}' بنجاح.")
+
+    return redirect('student_detail', student_id=student.id)
+
 
 # Teacher views
 def teacher_financial_detail(request, teacher_id):
@@ -1378,25 +1419,36 @@ def api_record_attendance(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date before processing payment >>>
+            # <<< FIX: Check enrollment date and suspension status before processing payment >>>
             try:
                 student_group_record = StudentGroup.objects.get(student=student, group=group)
                 enrollment_date = student_group_record.enrollment_date
+                suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
             except StudentGroup.DoesNotExist:
                 enrollment_date = None # Should not happen if data is consistent, but a safe fallback
+                suspension_periods = []
 
             # Conditions for payment
             is_already_paid = attendance.student_paid_for_session
             has_enough_balance = student.prepaid_balance >= price_per_session
             is_after_enrollment = enrollment_date is not None and session.date >= enrollment_date
 
-            if not is_already_paid and has_enough_balance and is_after_enrollment:
+            is_suspended = False
+            for suspension in suspension_periods:
+                is_open_suspension = suspension.end_date is None
+                if suspension.start_date <= session.date and (is_open_suspension or session.date <= suspension.end_date):
+                    is_suspended = True
+                    break
+
+            if not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
                 payment_status_message = "" # Paid successfully
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
+            elif is_suspended:
+                payment_status_message = "لم يتم الخصم (فترة تجميد)"
             elif enrollment_date and session.date < enrollment_date:
                 payment_status_message = "لم يتم الخصم (الحصة قبل تاريخ التسجيل)"
             elif not has_enough_balance:
@@ -1476,6 +1528,9 @@ def student_payment(request, student_id):
                         messages.error(request, f"لم يتم العثور على تاريخ تسجيل الطالب في الفوج {group_to_pay_for.name}.")
                         return redirect('student_payment', student_id=student_id)
 
+                    # Get suspension periods
+                    suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_enrollment))
+
                     # Get all sessions for this student in this group, ordered by date, FILTERING by enrollment date
                     # We want to pay for the earliest unpaid sessions first.
                     student_group_sessions = Session.objects.filter(
@@ -1490,13 +1545,24 @@ def student_payment(request, student_id):
                         if paid_this_transaction_count >= sessions_to_pay_count:
                             break # Paid enough sessions for this transaction
 
+                        # <<< FIX: Check if session is within a suspension period >>>
+                        is_suspended = False
+                        for suspension in suspension_periods:
+                            is_open_suspension = suspension.end_date is None
+                            if suspension.start_date <= session_obj.date and (is_open_suspension or session_obj.date <= suspension.end_date):
+                                is_suspended = True
+                                break
+
+                        if is_suspended:
+                            continue # Skip this session, do not pay for it
+
                         attendance, created = Attendance.objects.get_or_create(
                             student=student,
                             session=session_obj,
                             defaults={'present': False} # Default to absent if no record, payment can still be made
                         )
 
-                        if not attendance.student_paid_for_session:
+                        if not attendance.student_paid_for_session and not attendance.excused_absence:
                             attendance.student_paid_for_session = True
                             # attendance.student_absent_and_forced_paid = not attendance.present # Optional: if student was absent, mark as forced paid
                             attendance.save()
@@ -2332,25 +2398,36 @@ def api_record_attendance_by_student(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date before processing payment >>>
+            # <<< FIX: Check enrollment date and suspension status before processing payment >>>
             try:
                 student_group_record = StudentGroup.objects.get(student=student, group=group)
                 enrollment_date = student_group_record.enrollment_date
+                suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
             except StudentGroup.DoesNotExist:
                 enrollment_date = None
+                suspension_periods = []
 
             is_already_paid = attendance.student_paid_for_session
             has_enough_balance = student.prepaid_balance >= price_per_session
             is_after_enrollment = enrollment_date is not None and target_session.date >= enrollment_date
 
+            is_suspended = False
+            for suspension in suspension_periods:
+                is_open_suspension = suspension.end_date is None
+                if suspension.start_date <= target_session.date and (is_open_suspension or target_session.date <= suspension.end_date):
+                    is_suspended = True
+                    break
+
             # Check if student has enough balance and session is not already paid
-            if not is_already_paid and has_enough_balance and is_after_enrollment:
+            if not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
                 payment_status_message = "" # Paid successfully
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
+            elif is_suspended:
+                payment_status_message = "لم يتم الخصم (فترة تجميد)"
             elif enrollment_date and target_session.date < enrollment_date:
                 payment_status_message = "لم يتم الخصم (الحصة قبل تاريخ التسجيل)"
             elif not has_enough_balance:
@@ -2525,6 +2602,9 @@ def student_monthly_payment_view(request, student_id):
             billable_unpaid_count = 0
             # Also calculate attended_but_not_paid_sessions_count in the same loop
 
+            # <<< FIX: Fetch suspension periods to exclude them from calculations >>>
+            suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group))
+
             # Base query for chronological sessions
             all_sessions_for_group_chronological = Session.objects.filter(
                 group=selected_group
@@ -2536,6 +2616,17 @@ def student_monthly_payment_view(request, student_id):
             current_date = timezone.now().date()
 
             for session_obj in all_sessions_for_group_chronological:
+                # <<< FIX: Check if session is within a suspension period >>>
+                is_suspended = False
+                for suspension in suspension_periods:
+                    is_open_suspension = suspension.end_date is None
+                    if suspension.start_date <= session_obj.date and (is_open_suspension or session_obj.date <= suspension.end_date):
+                        is_suspended = True
+                        break
+
+                if is_suspended:
+                    continue # Skip this session entirely from calculations
+
                 att = Attendance.objects.filter(student=student, session=session_obj).first()
                 is_past_or_current_session = session_obj.date <= current_date
 
@@ -2668,12 +2759,15 @@ def student_monthly_payment_view(request, student_id):
                     # Use the correctly fetched group details for POST
                     all_sessions_chronological = Session.objects.filter(group=current_group_details_post).order_by('date', 'start_time')
 
-                    # <<< FIX: Apply enrollment_date filter during payment processing >>>
+                    # <<< FIX: Apply enrollment_date filter and get suspension periods during payment processing >>>
                     try:
                         student_group_for_payment = StudentGroup.objects.get(student=student, group=current_group_details_post)
                         enrollment_date_for_payment = student_group_for_payment.enrollment_date
                         if enrollment_date_for_payment:
                             all_sessions_chronological = all_sessions_chronological.filter(date__gte=enrollment_date_for_payment)
+
+                        suspension_periods_for_payment = list(StudentSuspension.objects.filter(student_group=student_group_for_payment))
+
                     except StudentGroup.DoesNotExist:
                         # This case should ideally not be reached if validation is correct, but as a safeguard:
                         messages.error(request, "لم يتم العثور على تاريخ تسجيل الطالب في الفوج. لا يمكن متابعة الدفع.")
@@ -2694,6 +2788,17 @@ def student_monthly_payment_view(request, student_id):
                             messages.error(request, "سعر الحصة المحدد للفوج غير صالح. لا يمكن معالجة الدفع.")
                             current_balance = Decimal('-1') # Mark balance as invalid to stop further processing
                             break
+
+                        # <<< FIX: Check if session is within a suspension period before paying >>>
+                        is_suspended = False
+                        for suspension in suspension_periods_for_payment:
+                            is_open_suspension = suspension.end_date is None
+                            if suspension.start_date <= session_obj.date and (is_open_suspension or session_obj.date <= suspension.end_date):
+                                is_suspended = True
+                                break
+
+                        if is_suspended:
+                            continue # Do not pay for this session
 
                         attendance, created = Attendance.objects.get_or_create(
                             student=student,
@@ -2956,19 +3061,47 @@ def teacher_monthly_payment_view(request, teacher_id):
                     'receipt_url': request.session.pop('last_teacher_payment_receipt_url', None)
                 })
 
-            # --- Simplified Calculation Logic ---
+            # --- FIX: Expanded Calculation Logic to handle suspensions ---
+
+            # 1. Pre-fetch all suspension data for students in the current group
+            student_groups_in_group = StudentGroup.objects.filter(group=current_group_post)
+            suspension_map = {}
+            for sg in student_groups_in_group:
+                suspension_map[sg.student_id] = list(StudentSuspension.objects.filter(student_group=sg))
+
+            # 2. Get all relevant attendance records
             attendance_records = Attendance.objects.filter(
                 session_id__in=selected_session_ids,
                 session__group=current_group_post
-            )
+            ).select_related('session')
 
-            # Count students present + students with unexcused absences
-            total_payable_instances = attendance_records.filter(
-                Q(present=True) | Q(excused_absence=False)
-            ).count()
+            # 3. Iterate and count payable instances, checking for suspensions
+            total_payable_instances = 0
+            total_presences = 0
+            total_unexcused_absences = 0
 
-            total_presences = attendance_records.filter(present=True).count()
-            total_unexcused_absences = total_payable_instances - total_presences
+            for att in attendance_records:
+                # Rule 1: Instance is not payable if absence is excused
+                if not att.present and att.excused_absence:
+                    continue
+
+                # Rule 2: Instance is not payable if student was suspended
+                student_suspensions = suspension_map.get(att.student_id, [])
+                is_suspended = False
+                for susp in student_suspensions:
+                    is_open_suspension = susp.end_date is None
+                    if susp.start_date <= att.session.date and (is_open_suspension or att.session.date <= susp.end_date):
+                        is_suspended = True
+                        break
+                if is_suspended:
+                    continue
+
+                # If checks pass, it's a payable instance
+                total_payable_instances += 1
+                if att.present:
+                    total_presences += 1
+                else: # Not present and not excused
+                    total_unexcused_absences += 1
 
             try:
                 teacher_price_decimal = Decimal(teacher_price_per_session_str)
@@ -3004,13 +3137,36 @@ def teacher_monthly_payment_view(request, teacher_id):
             final_payment_amount = Decimal('0.00')
             compensated_count = 0
 
+            # <<< FIX: Fetch suspension data ONCE before the loop >>>
+            student_groups_in_group_post = StudentGroup.objects.filter(group=current_group_post)
+            suspension_map_post = {}
+            for sg in student_groups_in_group_post:
+                suspension_map_post[sg.student_id] = list(StudentSuspension.objects.filter(student_group=sg))
+
+
             with transaction.atomic():
-                sessions_to_process = Session.objects.filter(id__in=session_ids_to_mark, group=current_group_post)
+                sessions_to_process = Session.objects.filter(id__in=session_ids_to_mark, group=current_group_post).prefetch_related('attendance_set')
                 for session in sessions_to_process:
-                    # Calculate payable instances for this specific session
-                    payable_instances_count = Attendance.objects.filter(
-                        session=session
-                    ).filter(Q(present=True) | Q(excused_absence=False)).count()
+                    # <<< FIX: Recalculate payable instances for this specific session, excluding suspended students >>>
+                    payable_instances_count = 0
+                    for att in session.attendance_set.all():
+                        # Rule 1: Not payable if excused absence
+                        if not att.present and att.excused_absence:
+                            continue
+
+                        # Rule 2: Not payable if suspended
+                        student_suspensions = suspension_map_post.get(att.student_id, [])
+                        is_suspended = False
+                        for susp in student_suspensions:
+                            is_open_suspension = susp.end_date is None
+                            if susp.start_date <= session.date and (is_open_suspension or session.date <= susp.end_date):
+                                is_suspended = True
+                                break
+                        if is_suspended:
+                            continue
+
+                        # If checks pass, it's a payable instance
+                        payable_instances_count += 1
 
                     session_payment_amount = payable_instances_count * teacher_price_decimal
 

@@ -92,15 +92,43 @@
                                     <span class="badge badge-info">{{ group_stat.payment_status_display }}</span>
                                 {% endif %}
                             </li>
+                             <li class="list-group-item d-flex justify-content-between align-items-center">
+                                حالة التسجيل في الفوج:
+                                {% if group_stat.is_active %}
+                                    <span class="badge badge-success">نشط</span>
+                                {% else %}
+                                    <span class="badge badge-secondary">موقوف مؤقتاً</span>
+                                {% endif %}
+                            </li>
                         </ul>
                         <div class="card-body">
-                             <h6 class="card-subtitle mb-2 text-muted">تفاصيل الحضور والدفع:</h6>
-                             <ul class="list-unstyled small">
-                                <li>حاضر ومدفوع: {{ group_stat.attended_and_paid_count }}</li>
-                                <li>حاضر وغير مدفوع: {{ group_stat.attended_not_paid_count }}</li>
-                                <li>غائب ومدفوع: {{ group_stat.absent_and_paid_count }}</li>
-                                <li>غائب وغير مدفوع: {{ group_stat.absent_not_paid_count }}</li>
-                             </ul>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <div>
+                                    <h6 class="card-subtitle mb-2 text-muted">تفاصيل الحضور والدفع:</h6>
+                                    <ul class="list-unstyled small">
+                                        <li>حاضر ومدفوع: {{ group_stat.attended_and_paid_count }}</li>
+                                        <li>حاضر وغير مدفوع: {{ group_stat.attended_not_paid_count }}</li>
+                                        <li>غائب ومدفوع: {{ group_stat.absent_and_paid_count }}</li>
+                                        <li>غائب وغير مدفوع: {{ group_stat.absent_not_paid_count }}</li>
+                                    </ul>
+                                </div>
+                                <div>
+                                    {% if group_stat.student_group_id %}
+                                        <form action="{% url 'toggle_student_suspension' group_stat.student_group_id %}" method="post" class="ml-auto">
+                                            {% csrf_token %}
+                                            {% if group_stat.is_active %}
+                                                <button type="submit" class="btn btn-warning" onclick="return confirm('هل أنت متأكد أنك تريد تجميد تسجيل هذا الطالب في الفوج؟ لن يتم احتساب الحصص القادمة له.');">
+                                                    <i class="fas fa-pause-circle"></i> تجميد التسجيل
+                                                </button>
+                                            {% else %}
+                                                <button type="submit" class="btn btn-success" onclick="return confirm('هل أنت متأكد أنك تريد إعادة تنشيط تسجيل هذا الطالب في الفوج؟ سيتم احتساب الحصص القادمة له مرة أخرى.');">
+                                                    <i class="fas fa-play-circle"></i> إعادة تنشيط
+                                                </button>
+                                            {% endif %}
+                                        </form>
+                                    {% endif %}
+                                </div>
+                            </div>
                         </div>
                     </div>
                 {% endfor %}

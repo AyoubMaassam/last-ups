@@ -94,6 +94,7 @@ class StudentGroup(models.Model):
     student = models.ForeignKey(Student, on_delete=models.CASCADE, verbose_name="الطالب")
     group = models.ForeignKey(Group, on_delete=models.CASCADE, verbose_name="الفوج")
     enrollment_date = models.DateField(auto_now_add=True, verbose_name="تاريخ التسجيل في الفوج")
+    is_active = models.BooleanField(default=True, verbose_name="الحالة (نشط)")
 
     class Meta:
         unique_together = ('student', 'group')
@@ -101,7 +102,22 @@ class StudentGroup(models.Model):
         verbose_name_plural = "تسجيلات الطلاب في الأفواج"
 
     def __str__(self):
-        return f"{self.student} enrolled in {self.group} on {self.enrollment_date}"
+        status = "نشط" if self.is_active else "موقوف"
+        return f"{self.student} in {self.group} since {self.enrollment_date} ({status})"
+
+class StudentSuspension(models.Model):
+    student_group = models.ForeignKey(StudentGroup, on_delete=models.CASCADE, related_name='suspensions', verbose_name="تسجيل الطالب في الفوج")
+    start_date = models.DateField(verbose_name="تاريخ بدء التجميد")
+    end_date = models.DateField(null=True, blank=True, verbose_name="تاريخ انتهاء التجميد")
+
+    class Meta:
+        ordering = ['-start_date']
+        verbose_name = "فترة تجميد الطالب"
+        verbose_name_plural = "فترات تجميد الطلاب"
+
+    def __str__(self):
+        end_str = self.end_date.strftime('%Y-%m-%d') if self.end_date else "حتى الآن"
+        return f"Suspension for {self.student_group.student} in {self.student_group.group} from {self.start_date.strftime('%Y-%m-%d')} to {end_str}"
 
 class Session(models.Model):
     group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name='sessions', verbose_name="الفوج")
