@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('school_app', '0011_alter_actionlog_action_type_alter_actionlog_details_and_more'),
+        ('school_app', '0011_alter_actionlog'),
     ]
 
     operations = [
