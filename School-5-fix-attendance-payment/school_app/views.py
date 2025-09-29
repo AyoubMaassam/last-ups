@@ -1479,7 +1479,7 @@ def api_record_attendance(request):
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
-                payment_status_message = "" # Paid successfully
+                payment_status_message = "الحصة مدفوعة بالفعل" # FIX: Unified payment message
                 sound_signal = 'sound1'
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
@@ -2470,7 +2470,7 @@ def api_record_attendance_by_student(request):
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
-                payment_status_message = ""
+                payment_status_message = "الحصة مدفوعة بالفعل" # FIX: Unified payment message
                 sound_signal = 'sound1'
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
