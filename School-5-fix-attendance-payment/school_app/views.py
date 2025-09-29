@@ -299,6 +299,10 @@ def student_detail(request, student_id):
                 absent_not_paid_count += 1
                 unpaid_non_excused_sessions_count += 1
 
+        # <<< FIX: If enrollment is free, ensure no amount is due by resetting the count >>>
+        if is_free:
+            unpaid_non_excused_sessions_count = 0
+
         amount_due_for_group = unpaid_non_excused_sessions_count * price_per_session
 
         payment_status_display = "لا توجد حصص مستحقة" # Default
@@ -1409,29 +1413,43 @@ def api_record_attendance(request):
         return JsonResponse({'status': 'error', 'message': 'الطالب غير موجود. تحقق من الرقم المدخل أو البطاقة.'}, status=404)
 
     try:
+        # <<< REFACTOR: Fetch student group info early to use in all logic paths >>>
+        try:
+            student_group_record = StudentGroup.objects.get(student=student, group=session.group)
+        except StudentGroup.DoesNotExist:
+            return JsonResponse({'status': 'error', 'message': 'الطالب غير مسجل في هذا الفوج.'}, status=400)
+
         attendance, created = Attendance.objects.get_or_create(
             student=student,
             session=session
         )
 
+        # <<< FIX: Handle already registered case with free status and sound >>>
         if not created and attendance.present:
-            # The student was already marked as present. Check payment status to inform the frontend.
-            payment_status = "" # Default to no message
-            if not attendance.student_paid_for_session:
-                payment_status = "الحصة لم تدفع بعد" # Only show message if not paid
+            payment_status = "الحصة لم تدفع بعد"
+            sound_signal = 'sound2' # Default for already registered but unpaid
+
+            if student_group_record.is_free:
+                payment_status = "تسجيل مجاني"
+                sound_signal = 'sound3'
+            elif attendance.student_paid_for_session:
+                payment_status = "الحصة مدفوعة بالفعل"
+                sound_signal = 'sound1'
 
             return JsonResponse({
                 'status': 'already_registered',
                 'message': f'الطالب {student.full_name} مسجل بالفعل في هذه الحصة.',
                 'student_name': student.full_name,
                 'session_info': f'{session.group.name} - {session.date} {session.start_time.strftime("%H:%M")}',
-                'payment_status': payment_status
+                'payment_status': payment_status,
+                'sound': sound_signal,
             }, status=200)
 
         attendance.present = True
 
         # --- Payment Logic ---
-        payment_status_message = "الحصة غير مدفوعة" # Default message
+        payment_status_message = "الحصة غير مدفوعة"
+        sound_signal = 'sound2' # Default for unpaid
         group = session.group
         price_per_session = Decimal('0.00')
 
@@ -1439,18 +1457,10 @@ def api_record_attendance(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date, suspension, and free status before processing payment >>>
-            try:
-                student_group_record = StudentGroup.objects.get(student=student, group=group)
-                enrollment_date = student_group_record.enrollment_date
-                suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
-                is_free_enrollment = student_group_record.is_free
-            except StudentGroup.DoesNotExist:
-                enrollment_date = None # Should not happen if data is consistent, but a safe fallback
-                suspension_periods = []
-                is_free_enrollment = False
+            enrollment_date = student_group_record.enrollment_date
+            is_free_enrollment = student_group_record.is_free
+            suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
 
-            # Conditions for payment
             is_already_paid = attendance.student_paid_for_session
             has_enough_balance = student.prepaid_balance >= price_per_session
             is_after_enrollment = enrollment_date is not None and session.date >= enrollment_date
@@ -1464,13 +1474,16 @@ def api_record_attendance(request):
 
             if is_free_enrollment:
                 payment_status_message = "تسجيل مجاني"
+                sound_signal = 'sound3'
             elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
                 payment_status_message = "" # Paid successfully
+                sound_signal = 'sound1'
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
+                sound_signal = 'sound1'
             elif is_suspended:
                 payment_status_message = "لم يتم الخصم (فترة تجميد)"
             elif enrollment_date and session.date < enrollment_date:
@@ -1481,25 +1494,20 @@ def api_record_attendance(request):
 
         elif attendance.student_paid_for_session:
              payment_status_message = "الحصة مدفوعة بالفعل"
+             sound_signal = 'sound1'
         else: # Price is zero
              payment_status_message = "الحصة مجانية (السعر 0)"
+             sound_signal = 'sound1' # Or a neutral sound
 
         attendance.save()
 
-
         # Calculate unpaid sessions for the student in this group
-        try:
-            student_group = StudentGroup.objects.get(student=student, group=session.group)
-            enrollment_date = student_group.enrollment_date
-        except StudentGroup.DoesNotExist:
-            enrollment_date = None
-
         unpaid_sessions_count = 0
-        if enrollment_date:
+        if student_group_record.enrollment_date:
             unpaid_sessions_count = Attendance.objects.filter(
                 student=student,
                 session__group=session.group,
-                session__date__gte=enrollment_date,
+                session__date__gte=student_group_record.enrollment_date,
                 student_paid_for_session=False,
                 excused_absence=False
             ).count()
@@ -1509,7 +1517,8 @@ def api_record_attendance(request):
             'message': 'تم تسجيل الحضور بنجاح.',
             'student_name': student.full_name,
             'session_info': f'{session.group.name} - {session.date} {session.start_time.strftime("%H:%M")}',
-            'payment_status': payment_status_message, # Use the dynamic message
+            'payment_status': payment_status_message,
+            'sound': sound_signal,
             'attendance_time': attendance.created_at.strftime("%Y-%m-%d %H:%M:%S"),
             'unpaid_sessions_count': unpaid_sessions_count
         }, status=201)
@@ -2395,32 +2404,43 @@ def api_record_attendance_by_student(request):
     target_session = potential_sessions[0][1]
 
     try:
+        # <<< REFACTOR: Fetch student group info early to use in all logic paths >>>
+        try:
+            student_group_record = StudentGroup.objects.get(student=student, group=target_session.group)
+        except StudentGroup.DoesNotExist:
+            return JsonResponse({'status': 'error', 'message': 'الطالب غير مسجل في هذا الفوج.'}, status=400)
+
         attendance, created = Attendance.objects.get_or_create(
             student=student,
             session=target_session
         )
 
+        # <<< FIX: Handle already registered case with free status and sound >>>
         if not created and attendance.present:
-            # The student was already marked as present. Check payment status to inform the frontend.
-            payment_status_message = "" # Default to no message
-            if not attendance.student_paid_for_session:
-                # This is the key change: inform the user that the session is still unpaid.
-                payment_status_message = "الحصة لم تدفع بعد"
+            payment_status_message = "الحصة لم تدفع بعد"
+            sound_signal = 'sound2'
+
+            if student_group_record.is_free:
+                payment_status_message = "تسجيل مجاني"
+                sound_signal = 'sound3'
+            elif attendance.student_paid_for_session:
+                payment_status_message = "الحصة مدفوعة بالفعل"
+                sound_signal = 'sound1'
 
             return JsonResponse({
                 'status': 'already_registered',
                 'message': f'الطالب {student.full_name} مسجل بالفعل في هذه الحصة.',
                 'student_name': student.full_name,
                 'session_info': f'{target_session.group.name} - {target_session.date}',
-                'payment_status_message': payment_status_message
+                'payment_status_message': payment_status_message,
+                'sound': sound_signal,
             }, status=200)
 
-        # If the record was newly created OR if it existed but the student was marked absent,
-        # we now mark them as present.
         attendance.present = True
 
         # --- Payment Logic ---
-        payment_status_message = "الحصة غير مدفوعة" # Default message
+        payment_status_message = "الحصة غير مدفوعة"
+        sound_signal = 'sound2'
         group = target_session.group
         price_per_session = Decimal('0.00')
 
@@ -2428,16 +2448,9 @@ def api_record_attendance_by_student(request):
             price_per_session = group.price_per_4_sessions / Decimal('4.0')
 
         if price_per_session > 0:
-            # <<< FIX: Check enrollment date, suspension, and free status before processing payment >>>
-            try:
-                student_group_record = StudentGroup.objects.get(student=student, group=group)
-                enrollment_date = student_group_record.enrollment_date
-                suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
-                is_free_enrollment = student_group_record.is_free
-            except StudentGroup.DoesNotExist:
-                enrollment_date = None
-                suspension_periods = []
-                is_free_enrollment = False
+            enrollment_date = student_group_record.enrollment_date
+            is_free_enrollment = student_group_record.is_free
+            suspension_periods = list(StudentSuspension.objects.filter(student_group=student_group_record))
 
             is_already_paid = attendance.student_paid_for_session
             has_enough_balance = student.prepaid_balance >= price_per_session
@@ -2450,44 +2463,43 @@ def api_record_attendance_by_student(request):
                     is_suspended = True
                     break
 
-            # Check if student has enough balance and session is not already paid
             if is_free_enrollment:
                 payment_status_message = "تسجيل مجاني"
+                sound_signal = 'sound3'
             elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
                 student.save(update_fields=['prepaid_balance'])
-                payment_status_message = "" # Paid successfully
+                payment_status_message = ""
+                sound_signal = 'sound1'
             elif is_already_paid:
                 payment_status_message = "الحصة مدفوعة بالفعل"
+                sound_signal = 'sound1'
             elif is_suspended:
                 payment_status_message = "لم يتم الخصم (فترة تجميد)"
             elif enrollment_date and target_session.date < enrollment_date:
                 payment_status_message = "لم يتم الخصم (الحصة قبل تاريخ التسجيل)"
             elif not has_enough_balance:
                 payment_status_message = f"رصيد غير كافٍ. الرصيد الحالي: {student.prepaid_balance.quantize(Decimal('0.01'))} دج"
+
         elif attendance.student_paid_for_session:
              payment_status_message = "الحصة مدفوعة بالفعل"
+             sound_signal = 'sound1'
         else: # Price is zero
              payment_status_message = "الحصة مجانية (السعر 0)"
-
+             sound_signal = 'sound1'
 
         attendance.save()
 
         auto_excused_message = ""
-        # Rule 2: If this is the student's first-ever 'present' record in this group, excuse previous absences *after enrollment*.
-        try:
-            student_group_record = StudentGroup.objects.get(student=student, group=target_session.group)
-            enrollment_date_for_excuse = student_group_record.enrollment_date
-        except StudentGroup.DoesNotExist:
-            enrollment_date_for_excuse = None
+        enrollment_date_for_excuse = student_group_record.enrollment_date
 
         if enrollment_date_for_excuse and Attendance.objects.filter(student=student, session__group=target_session.group, present=True, session__date__gte=enrollment_date_for_excuse).count() == 1:
             previous_absences_to_excuse = Attendance.objects.filter(
                 student=student,
                 session__group=target_session.group,
                 session__date__lt=target_session.date,
-                session__date__gte=enrollment_date_for_excuse, # <<< FIX: Only excuse absences after enrollment
+                session__date__gte=enrollment_date_for_excuse,
                 present=False,
                 excused_absence=False
             )
@@ -2495,25 +2507,15 @@ def api_record_attendance_by_student(request):
             if updated_count > 0:
                 auto_excused_message = f"تم تحويل {updated_count} غياب سابق إلى غياب معذور تلقائياً."
 
-
-        # Calculate unpaid sessions for the student in this group
-        try:
-            student_group = StudentGroup.objects.get(student=student, group=target_session.group)
-            enrollment_date = student_group.enrollment_date
-        except StudentGroup.DoesNotExist:
-            enrollment_date = None
-
         unpaid_sessions_count = 0
-        if enrollment_date:
+        if enrollment_date_for_excuse:
             unpaid_sessions_count = Attendance.objects.filter(
                 student=student,
                 session__group=target_session.group,
-                session__date__gte=enrollment_date,
+                session__date__gte=enrollment_date_for_excuse,
                 student_paid_for_session=False,
                 excused_absence=False
             ).count()
-
-
 
         return JsonResponse({
             'status': 'success',
@@ -2521,6 +2523,7 @@ def api_record_attendance_by_student(request):
             'student_name': student.full_name,
             'session_info': f'{target_session.group.name} - {target_session.date}',
             'payment_status_message': payment_status_message,
+            'sound': sound_signal,
             'session_id': target_session.id,
             'unpaid_sessions_count': unpaid_sessions_count,
             'auto_excused_message': auto_excused_message
