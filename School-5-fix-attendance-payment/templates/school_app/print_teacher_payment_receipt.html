@@ -42,10 +42,10 @@
     <div class="receipt-line">  عدد الحصص      : {{ total_sessions }}</div>
     <div class="receipt-line">  عدد التلاميذ   : {{ student_count }}</div>
     <div class="receipt-line">  عدد الحضور (مدفوع) : {{ total_presences }}</div>
-    <div class="receipt-line">  الغيابات (مدفوعة)   : {{ total_absences_counted }}</div>
-    <div class="receipt-line">  الحضور (مجاني)   : {{ total_free_presences }}</div>
-    <div class="receipt-line">  الغيابات (مجانية)   : {{ total_free_absences }}</div>
-    <div class="receipt-line">  الغيابات (معذورة) : {{ excused_absences_count }}</div>
+    <div class="receipt-line">  الغيابات المحسوبة   : {{ total_absences_counted }}</div>
+    <div class="receipt-line">  الغيابات المعذورة : {{ excused_absences_count }}</div>
+    <div class="receipt-line">  الحضور المجاني   : {{ total_free_presences }}</div>
+    <div class="receipt-line">  عدد التلاميذ المجاني : {{ free_student_count }}</div>
     <div class="receipt-line"></div>
     <div class="receipt-line">  ---------------------------</div>
     <div class="receipt-line">  المجموع الكلي : {{ total_payment_amount|floatformat:0 }} دج</div>

@@ -1431,7 +1431,7 @@ def api_record_attendance(request):
 
             if student_group_record.is_free:
                 payment_status = "تسجيل مجاني"
-                sound_signal = 'sound3'
+                sound_signal = 'sound1' # FIX: Changed from sound3 to sound1
             elif attendance.student_paid_for_session:
                 payment_status = "الحصة مدفوعة بالفعل"
                 sound_signal = 'sound1'
@@ -1474,7 +1474,7 @@ def api_record_attendance(request):
 
             if is_free_enrollment:
                 payment_status_message = "تسجيل مجاني"
-                sound_signal = 'sound3'
+                sound_signal = 'sound1' # FIX: Changed from sound3 to sound1
             elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
@@ -2422,7 +2422,7 @@ def api_record_attendance_by_student(request):
 
             if student_group_record.is_free:
                 payment_status_message = "تسجيل مجاني"
-                sound_signal = 'sound3'
+                sound_signal = 'sound1' # FIX: Changed from sound3 to sound1
             elif attendance.student_paid_for_session:
                 payment_status_message = "الحصة مدفوعة بالفعل"
                 sound_signal = 'sound1'
@@ -2465,7 +2465,7 @@ def api_record_attendance_by_student(request):
 
             if is_free_enrollment:
                 payment_status_message = "تسجيل مجاني"
-                sound_signal = 'sound3'
+                sound_signal = 'sound1' # FIX: Changed from sound3 to sound1
             elif not is_already_paid and has_enough_balance and is_after_enrollment and not is_suspended:
                 student.prepaid_balance -= price_per_session
                 attendance.student_paid_for_session = True
@@ -3051,6 +3051,7 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
     # <<< FIX: Retrieve free student stats from GET params >>>
     total_free_presences_str = request.GET.get('total_free_presences', '0')
     total_free_absences_str = request.GET.get('total_free_absences', '0')
+    free_student_count_str = request.GET.get('free_student_count', '0')
 
 
     try:
@@ -3063,6 +3064,7 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         excused_absences_count = int(excused_absences_count_str)
         total_free_presences = int(total_free_presences_str)
         total_free_absences = int(total_free_absences_str)
+        free_student_count = int(free_student_count_str)
     except (ValueError, TypeError):
         messages.error(request, "بيانات الإيصال غير صالحة.")
         return redirect(reverse('teacher_monthly_payment', args=[teacher_id]) + f"?group_id={group_id}")
@@ -3079,6 +3081,7 @@ def print_teacher_payment_receipt(request, teacher_id, group_id):
         'excused_absences_count': excused_absences_count,
         'total_free_presences': total_free_presences,
         'total_free_absences': total_free_absences,
+        'free_student_count': free_student_count,
         'print_date': timezone.now(),
     }
     return render(request, 'school_app/print_teacher_payment_receipt.html', context)
@@ -3129,11 +3132,14 @@ def teacher_monthly_payment_view(request, teacher_id):
             # 1. Pre-fetch all StudentGroup data for students in the current group
             student_groups_in_group = StudentGroup.objects.filter(group=current_group_post)
             student_data_map = {}
+            free_student_count = 0
             for sg in student_groups_in_group:
                 student_data_map[sg.student_id] = {
                     'is_free': sg.is_free,
                     'suspensions': list(StudentSuspension.objects.filter(student_group=sg))
                 }
+                if sg.is_free:
+                    free_student_count += 1
 
             # 2. Get all relevant attendance records
             attendance_records = Attendance.objects.filter(
@@ -3200,6 +3206,7 @@ def teacher_monthly_payment_view(request, teacher_id):
                 # <<< FIX: Add free student stats to session data >>>
                 'total_free_presences': total_free_presences,
                 'total_free_absences': total_free_absences,
+                'free_student_count': free_student_count,
             }
             messages.success(request, "تم حساب المبلغ. يرجى المراجعة والتأكيد.")
             return redirect(redirect_url)
@@ -3279,7 +3286,8 @@ def teacher_monthly_payment_view(request, teacher_id):
                               f"&total_sessions={len(session_ids_to_mark)}" + \
                               f"&excused_absences_count={excused_absences_count}" + \
                               f"&total_free_presences={calculated_payment_details.get('total_free_presences', 0)}" + \
-                              f"&total_free_absences={calculated_payment_details.get('total_free_absences', 0)}"
+                              f"&total_free_absences={calculated_payment_details.get('total_free_absences', 0)}" + \
+                              f"&free_student_count={calculated_payment_details.get('free_student_count', 0)}"
                 request.session['last_teacher_payment_receipt_url'] = receipt_url
                 messages.success(request, f"تم تسجيل دفع المستحقات لـ {compensated_count} حصة بنجاح.")
             else:
